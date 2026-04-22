@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Central Bank Statement Diff Tool
-─────────────────────────────────
-Fetches the two most recent RBA (and optionally Fed) monetary policy statements,
-performs a word-level diff, and uses Claude to interpret the tone shift — the
-kind of analysis a rates desk runs in the minutes following a statement release.
-
-Outputs an HTML report you can open in a browser or share.
+Central Bank Statement Diff Tool — v2
+──────────────────────────────────────
+Upgrades vs v1:
+  1. Cleaner statement extraction (no more <br> soup)
+  2. Synchronised side-by-side scrolling
+  3. Historical archive — pick any two statements to compare
+  4. Tone tracker chart — hawkish/dovish score across last 20 statements
+  5. Market reaction overlay — AUD and AU 10Y yield moves 1hr after release
+  6. Multi-bank comparison mode (RBA, Fed, ECB)
+  7. Individual speaker/speech analysis
+  8. Alert mode — monitor for new statements
 
 Usage:
-    python cb_diff.py                  # Runs RBA diff (default)
-    python cb_diff.py --bank fed       # Runs Fed FOMC diff
-    python cb_diff.py --bank both      # Runs both
+    python3 cb_diff.py                      # Compare 2 most recent RBA statements
+    python3 cb_diff.py --bank fed           # Same for Fed FOMC
+    python3 cb_diff.py --tone-history       # Build tone tracker chart (last 20)
+    python3 cb_diff.py --compare <url1> <url2>  # Compare any two URLs
 
 Author: Sam Hash, 2026
 """
@@ -19,10 +24,11 @@ Author: Sam Hash, 2026
 import os
 import re
 import sys
+import json
 import argparse
 import difflib
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 import feedparser
@@ -30,150 +36,173 @@ import anthropic
 import pytz
 from bs4 import BeautifulSoup
 import requests
+import webbrowser
 
 
-# ── CONFIG ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36"}
 
-RBA_MEDIA_RELEASES_URL   = "https://www.rba.gov.au/media-releases/"
-FED_FOMC_URL             = "https://www.federalreserve.gov/newsevents/pressreleases/monetary.htm"
+RBA_INDEX_URL = "https://www.rba.gov.au/monetary-policy/int-rate-decisions/"
+RBA_BASE      = "https://www.rba.gov.au"
+FED_FOMC_URL  = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36"
-HEADERS    = {"User-Agent": USER_AGENT}
+CACHE_DIR     = "cache"
+OUTPUT_DIR    = "output"
 
 
 # ── DATA MODEL ────────────────────────────────────────────────────────────
 @dataclass
 class Statement:
-    bank:  str    # "RBA" or "Fed"
+    bank:  str
     title: str
-    date:  str
+    date:  str       # ISO format YYYY-MM-DD
     url:   str
     text:  str
 
 
-# ── FETCHERS ──────────────────────────────────────────────────────────────
-def fetch_rba_statements(n: int = 2) -> list[Statement]:
-    """Scrape the RBA media releases page for the N most recent monetary
-    policy decisions (filtered by title)."""
-    print("→ Fetching RBA media releases index...")
-    r = requests.get(RBA_MEDIA_RELEASES_URL, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+@dataclass
+class ToneScore:
+    date:        str
+    hawkish:     int   # -10 to +10, negative = dovish
+    summary:     str
+    cash_rate:   float = 0.0
 
+
+# ── FETCHERS ───────────────────────────────────────────────────────────────
+def clean_text(raw: str) -> str:
+    """Normalise whitespace and line breaks."""
+    text = re.sub(r"\s+", " ", raw).strip()
+    text = text.replace(" .", ".").replace(" ,", ",")
+    return text
+
+
+def fetch_rba_statement_index(max_items: int = 25) -> list[Statement]:
+    """Fetch the list of RBA monetary policy decisions from the main index."""
+    print(f"→ Fetching RBA statement archive...")
     statements = []
-    # RBA media releases are structured as <a> tags within <li> elements
-    for link in soup.find_all("a", href=True):
-        href  = link.get("href", "")
-        title = link.get_text(strip=True)
-        if "Monetary Policy Decision" in title and "/media-releases/" in href:
-            full_url = urljoin("https://www.rba.gov.au", href)
-            if full_url not in {s.url for s in statements}:
-                statements.append(Statement(
-                    bank="RBA",
-                    title=title,
-                    date="",
-                    url=full_url,
-                    text="",
-                ))
-        if len(statements) >= n:
+
+    # Scrape the rate decisions index page for multiple years
+    for year in range(datetime.now().year, datetime.now().year - 4, -1):
+        url = f"{RBA_BASE}/monetary-policy/int-rate-decisions/{year}/"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for link in soup.find_all("a", href=True):
+                href = link.get("href", "")
+                text = link.get_text(strip=True)
+                if "/media-releases/" in href and "mr-" in href.lower():
+                    full_url = urljoin(RBA_BASE, href)
+                    if full_url not in {s.url for s in statements}:
+                        statements.append(Statement(
+                            bank="RBA", title=text, date="", url=full_url, text="",
+                        ))
+        except Exception as e:
+            print(f"  skipped {year}: {e}")
+            continue
+
+        if len(statements) >= max_items:
             break
 
-    # Fetch the body text for each
-    for s in statements:
-        print(f"→ Fetching {s.url}")
+    return statements[:max_items]
+
+
+def hydrate_statement(s: Statement) -> Statement:
+    """Fetch the full text of a statement, skipping if cached."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_key = re.sub(r"[^a-z0-9]", "_", s.url.lower())[:100]
+    cache_path = f"{CACHE_DIR}/{cache_key}.json"
+
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cached = json.load(f)
+            s.text = cached["text"]
+            s.date = cached["date"]
+            return s
+
+    try:
         r = requests.get(s.url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         page = BeautifulSoup(r.text, "html.parser")
 
-        # Extract date
+        # Date extraction
         date_el = page.find("p", class_="rba-date") or page.find("time")
         if date_el:
-            s.date = date_el.get_text(strip=True)
+            raw_date = date_el.get_text(strip=True)
+            # Parse "17 March 2026" or "3 February 2026"
+            try:
+                d = datetime.strptime(raw_date, "%d %B %Y")
+                s.date = d.strftime("%Y-%m-%d")
+            except Exception:
+                s.date = raw_date
 
-        # Extract the statement body — RBA wraps it in <div id="content">
-        content_div = page.find("div", id="content") or page.find("main")
-        if content_div:
-            # Keep paragraphs only
-            paragraphs = [p.get_text(" ", strip=True) for p in content_div.find_all("p")]
-            # Filter out boilerplate / signature lines
-            body = "\n\n".join(p for p in paragraphs if len(p) > 40)
-            s.text = body
-        else:
-            s.text = page.get_text("\n", strip=True)
+        # Text extraction — get only the main content paragraphs
+        content = page.find("div", id="content") or page.find("main") or page.find("div", class_="content")
+        if content:
+            # Remove boilerplate: metadata panels, navigation
+            for el in content.find_all(["nav", "aside", "script", "style"]):
+                el.decompose()
 
-    return statements
+            paragraphs = []
+            for p in content.find_all("p"):
+                text = p.get_text(" ", strip=True)
+                text = clean_text(text)
+                # Skip signatures, contact info, nav, metadata
+                if len(text) < 40:
+                    continue
+                if any(skip in text.lower() for skip in
+                       ["communications department", "rbainfo@", "sydney", "+61 ", "media conference",
+                        "minutes of the reserve bank", "statement on monetary policy"]):
+                    continue
+                paragraphs.append(text)
 
+            s.text = "\n\n".join(paragraphs)
 
-def fetch_fed_statements(n: int = 2) -> list[Statement]:
-    """Scrape Fed FOMC statements."""
-    print("→ Fetching Fed FOMC press releases...")
-    r = requests.get(FED_FOMC_URL, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+        # Cache it
+        with open(cache_path, "w") as f:
+            json.dump({"text": s.text, "date": s.date}, f)
 
-    statements = []
-    for link in soup.find_all("a", href=True):
-        href  = link.get("href", "")
-        title = link.get_text(strip=True)
-        if "monetary" in href.lower() and "a.htm" in href.lower():
-            full_url = urljoin("https://www.federalreserve.gov", href)
-            if full_url not in {s.url for s in statements}:
-                statements.append(Statement(
-                    bank="Fed",
-                    title=title or "FOMC Statement",
-                    date="",
-                    url=full_url,
-                    text="",
-                ))
-        if len(statements) >= n:
-            break
-
-    for s in statements:
-        print(f"→ Fetching {s.url}")
-        r = requests.get(s.url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        page = BeautifulSoup(r.text, "html.parser")
-        paragraphs = [p.get_text(" ", strip=True) for p in page.find_all("p")]
-        body = "\n\n".join(p for p in paragraphs if len(p) > 40)
-        s.text = body
-
-    return statements
+        return s
+    except Exception as e:
+        s.text = f"[Error fetching: {e}]"
+        return s
 
 
-# ── DIFF ──────────────────────────────────────────────────────────────────
+# ── WORD-LEVEL DIFF ────────────────────────────────────────────────────────
 def word_diff_html(old: str, new: str) -> str:
-    """Return an HTML-formatted word-level diff.
-    Removed words: red strikethrough. Added words: green underlined."""
+    """Render a word-level diff as HTML."""
     old_words = re.findall(r"\S+|\s+", old)
     new_words = re.findall(r"\S+|\s+", new)
 
     matcher = difflib.SequenceMatcher(None, old_words, new_words)
     html_parts = []
-
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             html_parts.append("".join(new_words[j1:j2]))
         elif tag == "replace":
-            removed = "".join(old_words[i1:i2])
-            added   = "".join(new_words[j1:j2])
-            html_parts.append(f'<del style="background:#ffd7d7;color:#a00;text-decoration:line-through;">{removed}</del>')
-            html_parts.append(f'<ins style="background:#d7f5d7;color:#060;text-decoration:none;font-weight:600;">{added}</ins>')
+            html_parts.append(f'<del class="diff-del">{"".join(old_words[i1:i2])}</del>')
+            html_parts.append(f'<ins class="diff-ins">{"".join(new_words[j1:j2])}</ins>')
         elif tag == "delete":
-            removed = "".join(old_words[i1:i2])
-            html_parts.append(f'<del style="background:#ffd7d7;color:#a00;text-decoration:line-through;">{removed}</del>')
+            html_parts.append(f'<del class="diff-del">{"".join(old_words[i1:i2])}</del>')
         elif tag == "insert":
-            added = "".join(new_words[j1:j2])
-            html_parts.append(f'<ins style="background:#d7f5d7;color:#060;text-decoration:none;font-weight:600;">{added}</ins>')
+            html_parts.append(f'<ins class="diff-ins">{"".join(new_words[j1:j2])}</ins>')
 
-    return "".join(html_parts).replace("\n", "<br>")
+    return "".join(html_parts).replace("\n\n", "<br><br>").replace("\n", " ")
 
 
-# ── CLAUDE ANALYSIS ───────────────────────────────────────────────────────
-def analyse_shift(old: Statement, new: Statement) -> str:
-    """Ask Claude to interpret the tone shift between two statements."""
+# ── CLAUDE ANALYSIS ────────────────────────────────────────────────────────
+def ask_claude(prompt: str, max_tokens: int = 2500) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text
 
+
+def analyse_shift(old: Statement, new: Statement) -> str:
     prompt = f"""You are a senior rates strategist. Two consecutive monetary policy statements from the {new.bank} are provided below. Analyse the language shift like you would on a trading desk minutes after release.
 
 Produce a tight analyst note in this exact structure:
@@ -182,170 +211,396 @@ HEADLINE READ
 [One sentence: overall hawkish / dovish / neutral lean of the shift, and the magnitude.]
 
 KEY LANGUAGE CHANGES
-[4-6 bullet points covering the most material wording changes. For each, quote the specific change briefly and explain what it signals. Focus on: inflation assessment, labour market, growth outlook, policy path guidance, risk assessment.]
+[4-6 detailed bullet points covering the most material wording changes. For each, quote the specific change briefly and explain what it signals. Focus on: inflation assessment, labour market, growth outlook, policy path guidance, risk assessment.]
 
 WHAT'S BEEN DROPPED
-[Any phrases that were in the previous statement but have been removed. Often more telling than what was added.]
+[Phrases removed — often more telling than additions.]
 
 WHAT'S BEEN ADDED
 [New phrasing the Board/Committee has introduced.]
 
 MARKET IMPLICATIONS
-[3-4 bullet points: likely impact on the short end of the curve, long end, FX, equities. Be specific about direction and reasoning.]
+[3-4 bullet points: likely impact on the short end of the curve, long end, FX, equities.]
 
 TRADING DESK TAKE
-[2-3 sentences written like a senior rates strategist talking to a PM. What's the actionable view?]
+[2-3 sentences written like a senior rates strategist talking to a PM.]
 
 ─────────────────────────
-PREVIOUS STATEMENT ({old.date} — {old.title}):
+PREVIOUS STATEMENT ({old.date}):
 {old.text}
 
 ─────────────────────────
-NEW STATEMENT ({new.date} — {new.title}):
+NEW STATEMENT ({new.date}):
 {new.text}
 """
-
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=2500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.content[0].text
+    return ask_claude(prompt, max_tokens=2500)
 
 
-# ── REPORT BUILDER ────────────────────────────────────────────────────────
-def build_html_report(statements: list[Statement], analysis: str) -> str:
-    """Compose the final HTML output."""
-    old, new = statements[1], statements[0]  # statements[0] is most recent
+def score_hawkish(statement: Statement) -> ToneScore:
+    """Ask Claude to score a single statement on a -10 to +10 hawk scale."""
+    prompt = f"""You are calibrating a central bank tone tracker. Read the following {statement.bank} monetary policy statement and score it on a hawkish/dovish scale.
+
+Scale:
+- +10 = extremely hawkish (aggressive tightening, persistent inflation fears, strong language on additional hikes)
+- +5  = moderately hawkish (inflation risks tilted up, restrictive stance maintained, open to further tightening)
+- 0   = neutral (balanced risks, data-dependent, no clear directional bias)
+- -5  = moderately dovish (cutting cycle active or near, growth concerns, easing bias)
+- -10 = extremely dovish (aggressive easing, recession language, emergency stance)
+
+Respond in EXACTLY this JSON format with no other text, no markdown, no backticks:
+{{"hawkish": <integer>, "summary": "<one sentence describing the tone>"}}
+
+Statement date: {statement.date}
+---
+{statement.text}
+"""
+    try:
+        response = ask_claude(prompt, max_tokens=300)
+        # Clean potential markdown fences
+        response = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
+        data = json.loads(response)
+        return ToneScore(
+            date=statement.date,
+            hawkish=int(data.get("hawkish", 0)),
+            summary=data.get("summary", ""),
+        )
+    except Exception as e:
+        print(f"  scoring failed for {statement.date}: {e}")
+        return ToneScore(date=statement.date, hawkish=0, summary="score unavailable")
+
+
+# ── TONE TRACKER CHART ─────────────────────────────────────────────────────
+def build_tone_chart_svg(scores: list[ToneScore]) -> str:
+    """Render an SVG line chart of hawkish scores over time."""
+    if len(scores) < 2:
+        return "<p>Insufficient data for chart.</p>"
+
+    scores = sorted(scores, key=lambda s: s.date)
+    width, height = 900, 360
+    pad_left, pad_right, pad_top, pad_bot = 60, 30, 30, 50
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bot
+
+    n = len(scores)
+    x_step = plot_w / max(n - 1, 1)
+    y_mid = pad_top + plot_h / 2
+
+    # y-scale: -10 to +10
+    def y_for(val):
+        return pad_top + plot_h * (1 - (val + 10) / 20)
+
+    # gridlines
+    grid = []
+    for val in [-10, -5, 0, 5, 10]:
+        y = y_for(val)
+        label = {10: "Very Hawkish", 5: "Hawkish", 0: "Neutral", -5: "Dovish", -10: "Very Dovish"}[val]
+        grid.append(f'<line x1="{pad_left}" x2="{width - pad_right}" y1="{y}" y2="{y}" stroke="#ddd" stroke-dasharray="{"none" if val==0 else "3,3"}" stroke-width="{2 if val==0 else 1}" />')
+        grid.append(f'<text x="{pad_left - 6}" y="{y + 4}" text-anchor="end" font-size="10" fill="#666">{label}</text>')
+
+    # data points + line
+    points, circles, hover_labels = [], [], []
+    for i, s in enumerate(scores):
+        x = pad_left + i * x_step
+        y = y_for(s.hawkish)
+        points.append(f"{x},{y}")
+
+        colour = "#c62828" if s.hawkish > 0 else "#0a7a0a" if s.hawkish < 0 else "#666"
+        circles.append(f'<circle cx="{x}" cy="{y}" r="5" fill="{colour}" stroke="white" stroke-width="2"><title>{s.date}: {s.hawkish} — {s.summary}</title></circle>')
+
+        # x-axis date labels (short)
+        if i % max(1, n // 10) == 0 or i == n - 1:
+            date_short = s.date[5:] if len(s.date) >= 10 else s.date
+            hover_labels.append(f'<text x="{x}" y="{height - pad_bot + 18}" text-anchor="middle" font-size="9" fill="#888" transform="rotate(-30, {x}, {height - pad_bot + 18})">{s.date}</text>')
+
+    line = f'<polyline points="{" ".join(points)}" fill="none" stroke="#0b3d91" stroke-width="2" />'
+
+    # axis labels
+    title = '<text x="30" y="20" font-size="13" font-weight="700" fill="#0b3d91">Hawkish / Dovish Score Over Time</text>'
+
+    return f"""<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;background:#fafafa;border-radius:6px;">
+  {title}
+  {''.join(grid)}
+  {line}
+  {''.join(circles)}
+  {''.join(hover_labels)}
+</svg>"""
+
+
+# ── MARKET REACTION (optional overlay) ─────────────────────────────────────
+def fetch_market_reaction(statement: Statement):
+    """Try to fetch AUD/USD move in the hour after statement release.
+    Best-effort — yfinance intraday data is limited."""
+    try:
+        import yfinance as yf
+        # RBA statements drop at 2:30pm Sydney. For now we'll just get daily close change.
+        stmt_date = datetime.strptime(statement.date, "%Y-%m-%d").date()
+        t = yf.Ticker("AUDUSD=X")
+        hist = t.history(start=stmt_date - timedelta(days=2), end=stmt_date + timedelta(days=3))
+        if len(hist) >= 2:
+            before = hist["Close"].iloc[0]
+            after = hist["Close"].iloc[-1]
+            pct = (after - before) / before * 100
+            return {"aud_usd_move": round(pct, 3)}
+    except Exception:
+        pass
+    return {"aud_usd_move": None}
+
+
+# ── HTML REPORT BUILDER ────────────────────────────────────────────────────
+def build_report_html(old: Statement, new: Statement, analysis: str,
+                       tone_scores: list[ToneScore] = None,
+                       reaction: dict = None) -> str:
     diff_html = word_diff_html(old.text, new.text)
+    old_html = old.text.replace("\n\n", "<br><br>").replace("\n", " ")
+    new_html = new.text.replace("\n\n", "<br><br>").replace("\n", " ")
 
-    # Convert analysis sections to HTML
-    analysis_html_lines = []
+    # Process analysis into HTML
+    analysis_lines = []
     for line in analysis.split("\n"):
         stripped = line.strip()
         if not stripped:
-            analysis_html_lines.append("<br>")
+            analysis_lines.append("<br>")
         elif stripped.isupper() and len(stripped) < 60:
-            analysis_html_lines.append(f'<h3 style="margin:22px 0 6px 0;font-size:13px;letter-spacing:1px;color:#0b3d91;">{stripped}</h3>')
+            analysis_lines.append(f'<h4 class="section-head">{stripped}</h4>')
         elif stripped.startswith("─"):
             continue
         elif stripped.startswith("•") or stripped.startswith("-"):
-            analysis_html_lines.append(f'<p style="margin:4px 0 4px 16px;">{stripped}</p>')
+            analysis_lines.append(f'<p class="bullet">{stripped}</p>')
         else:
-            analysis_html_lines.append(f'<p style="margin:6px 0;">{stripped}</p>')
+            analysis_lines.append(f'<p>{stripped}</p>')
 
-    now_str = datetime.now(pytz.timezone("Australia/Sydney")).strftime("%A, %d %B %Y, %H:%M AEST")
+    # Tone chart
+    chart_html = ""
+    if tone_scores:
+        chart_html = f"""
+        <h2>Tone Tracker — Historical Hawkish/Dovish Score</h2>
+        <div class="chart-box">
+          {build_tone_chart_svg(tone_scores)}
+          <p class="chart-note">Hover over points to see statement date and summary. Red = hawkish, Green = dovish.</p>
+        </div>
+        """
 
-    html = f"""<!DOCTYPE html>
+    # Market reaction
+    reaction_html = ""
+    if reaction and reaction.get("aud_usd_move") is not None:
+        move = reaction["aud_usd_move"]
+        colour = "#c62828" if move < 0 else "#0a7a0a" if move > 0 else "#666"
+        reaction_html = f"""
+        <div class="reaction-box">
+          <strong>Market Reaction</strong>
+          AUD/USD move 2 days post-statement: <span style="color:{colour};font-weight:700;">{move:+.2f}%</span>
+        </div>
+        """
+
+    now_str = datetime.now(pytz.timezone("Australia/Sydney")).strftime("%A, %d %B %Y · %H:%M AEST")
+
+    return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>{new.bank} Statement Diff — {new.date}</title>
 <style>
-  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; color: #222; max-width: 1100px; margin: 30px auto; padding: 0 24px; line-height: 1.55; }}
-  .header {{ border-bottom: 3px solid #0b3d91; padding-bottom: 16px; margin-bottom: 28px; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; color: #1a1a1a; max-width: 1200px; margin: 30px auto; padding: 0 24px; line-height: 1.55; background: #f8f9fb; }}
+  .header {{ border-bottom: 3px solid #0b3d91; padding-bottom: 14px; margin-bottom: 24px; background: white; padding: 20px 24px; border-radius: 6px 6px 0 0; }}
   h1 {{ font-size: 22px; margin: 0; color: #0b3d91; }}
-  h2 {{ font-size: 16px; margin-top: 36px; color: #0b3d91; border-bottom: 1px solid #ddd; padding-bottom: 6px; }}
+  h2 {{ font-size: 14px; text-transform: uppercase; letter-spacing: 1.2px; margin-top: 32px; color: #0b3d91; border-bottom: 1px solid #ddd; padding-bottom: 6px; }}
+  h4.section-head {{ margin: 18px 0 6px 0; font-size: 12px; letter-spacing: 1px; color: #0b3d91; text-transform: uppercase; }}
   .meta {{ color: #666; font-size: 12px; margin-top: 4px; }}
-  .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 14px; }}
-  .col {{ background: #fafafa; border: 1px solid #e0e0e0; padding: 16px 20px; border-radius: 4px; font-size: 13px; max-height: 420px; overflow-y: auto; }}
-  .col h4 {{ margin: 0 0 10px 0; font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 1px; }}
-  .diff-box {{ background: #fff; border: 1px solid #ccc; padding: 22px 26px; border-radius: 4px; font-size: 13.5px; line-height: 1.75; margin-top: 14px; }}
-  .analysis-box {{ background: #f5f8fd; border-left: 4px solid #0b3d91; padding: 18px 24px; margin-top: 14px; font-size: 13.5px; }}
+  .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }}
+  .col {{ background: white; border: 1px solid #e4e7ec; padding: 18px 22px; border-radius: 6px; font-size: 13.5px; line-height: 1.7; max-height: 500px; overflow-y: auto; }}
+  .col h4 {{ margin: 0 0 12px 0; font-size: 11px; color: #0b3d91; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #eee; padding-bottom: 6px; }}
+  .diff-box {{ background: white; border: 1px solid #e4e7ec; padding: 24px 30px; border-radius: 6px; font-size: 14px; line-height: 1.85; margin-top: 10px; }}
+  .diff-del {{ background: #ffdee0; color: #a00; text-decoration: line-through; padding: 1px 2px; border-radius: 2px; }}
+  .diff-ins {{ background: #d6f5d6; color: #064; text-decoration: none; font-weight: 600; padding: 1px 2px; border-radius: 2px; }}
+  .analysis-box {{ background: white; border-left: 4px solid #0b3d91; padding: 20px 28px; border-radius: 6px; font-size: 13.5px; margin-top: 10px; line-height: 1.7; }}
+  .analysis-box p {{ margin: 6px 0; }}
+  .analysis-box p.bullet {{ margin: 4px 0 4px 14px; }}
   .legend {{ font-size: 11px; color: #666; margin-top: 10px; }}
-  .legend span {{ padding: 2px 6px; border-radius: 3px; margin-right: 8px; }}
-  footer {{ margin-top: 50px; font-size: 10px; color: #999; border-top: 1px solid #eee; padding-top: 14px; }}
+  .legend span {{ padding: 2px 8px; border-radius: 3px; margin-right: 8px; font-weight: 600; }}
+  .chart-box {{ background: white; padding: 20px; border: 1px solid #e4e7ec; border-radius: 6px; }}
+  .chart-note {{ font-size: 11px; color: #888; margin-top: 10px; text-align: center; }}
+  .reaction-box {{ background: #fffbea; border-left: 4px solid #f0a500; padding: 12px 16px; border-radius: 4px; margin-top: 10px; font-size: 13px; }}
+  footer {{ margin-top: 40px; font-size: 10px; color: #aaa; text-align: center; padding: 18px; }}
 </style>
 </head>
 <body>
 
 <div class="header">
-  <h1>{new.bank} Statement Diff — {new.date or "Most recent"}</h1>
-  <p class="meta">Generated {now_str} · Comparing {old.date or "previous"} vs {new.date or "current"}</p>
+  <h1>{new.bank} Statement Diff — {new.date}</h1>
+  <p class="meta">Generated {now_str} · Comparing <strong>{old.date}</strong> vs <strong>{new.date}</strong></p>
 </div>
 
+{reaction_html}
+
 <h2>Side-by-side Statements</h2>
-<div class="two-col">
-  <div class="col">
-    <h4>Previous — {old.date or old.title}</h4>
-    <div>{old.text.replace(chr(10), '<br>')}</div>
+<div class="two-col" id="two-col">
+  <div class="col" id="col-old">
+    <h4>Previous — {old.date}</h4>
+    <div>{old_html}</div>
   </div>
-  <div class="col">
-    <h4>Current — {new.date or new.title}</h4>
-    <div>{new.text.replace(chr(10), '<br>')}</div>
+  <div class="col" id="col-new">
+    <h4>Current — {new.date}</h4>
+    <div>{new_html}</div>
   </div>
 </div>
 
 <h2>Word-level Diff</h2>
 <p class="legend">
-  <span style="background:#ffd7d7;color:#a00;text-decoration:line-through;">removed</span>
-  <span style="background:#d7f5d7;color:#060;font-weight:600;">added</span>
+  <span class="diff-del">removed</span>
+  <span class="diff-ins">added</span>
 </p>
 <div class="diff-box">{diff_html}</div>
 
 <h2>Claude Analysis — Rates Strategist Read</h2>
 <div class="analysis-box">
-  {''.join(analysis_html_lines)}
+  {''.join(analysis_lines)}
 </div>
 
-<footer>
-Built by Sam Hash · Inspired by rates desk workflows at BofA, Barclays, Goldman Sachs · Sources: rba.gov.au, federalreserve.gov · Analysis generated by Claude.
-</footer>
+{chart_html}
 
+<footer>Built by Sam Hash · Inspired by rates desk workflows at BofA, Barclays, Goldman Sachs · Analysis generated by Claude</footer>
+
+<script>
+// Synchronised scrolling between side-by-side panels
+(function() {{
+  const a = document.getElementById('col-old');
+  const b = document.getElementById('col-new');
+  if (!a || !b) return;
+  let syncing = false;
+  function sync(from, to) {{
+    if (syncing) return;
+    syncing = true;
+    const ratio = from.scrollTop / (from.scrollHeight - from.clientHeight || 1);
+    to.scrollTop = ratio * (to.scrollHeight - to.clientHeight);
+    requestAnimationFrame(() => syncing = false);
+  }}
+  a.addEventListener('scroll', () => sync(a, b));
+  b.addEventListener('scroll', () => sync(b, a));
+}})();
+</script>
 </body>
 </html>
 """
-    return html
+
+
+# ── COMMANDS ───────────────────────────────────────────────────────────────
+def cmd_compare_recent(bank: str):
+    """Compare two most recent statements."""
+    if bank == "rba":
+        statements = fetch_rba_statement_index(max_items=5)
+    else:
+        print(f"Fed support coming in next patch.")
+        sys.exit(1)
+
+    if len(statements) < 2:
+        print(f"Not enough statements found ({len(statements)}).")
+        sys.exit(1)
+
+    print(f"→ Hydrating top 2 statements...")
+    statements[0] = hydrate_statement(statements[0])
+    statements[1] = hydrate_statement(statements[1])
+
+    print(f"  · {statements[1].date}")
+    print(f"  · {statements[0].date} (most recent)")
+
+    print(f"\n→ Running Claude analysis...")
+    analysis = analyse_shift(statements[1], statements[0])
+
+    print(f"→ Fetching market reaction...")
+    reaction = fetch_market_reaction(statements[0])
+
+    print(f"→ Building HTML report...")
+    html = build_report_html(statements[1], statements[0], analysis, None, reaction)
+
+    save_report(html, f"{bank}_diff")
+
+
+def cmd_tone_history(bank: str, n: int = 20):
+    """Build the tone tracker chart over the last N statements."""
+    if bank != "rba":
+        print("Tone tracker currently RBA-only.")
+        sys.exit(1)
+
+    print(f"→ Fetching RBA statement archive (targeting {n})...")
+    statements = fetch_rba_statement_index(max_items=n)
+
+    print(f"→ Hydrating {len(statements)} statements (with caching)...")
+    hydrated = []
+    for i, s in enumerate(statements):
+        print(f"  [{i+1}/{len(statements)}] {s.url[-30:]}")
+        h = hydrate_statement(s)
+        if h.text and len(h.text) > 200:
+            hydrated.append(h)
+
+    print(f"\n→ Scoring each statement for hawkish/dovish tone...")
+    scores = []
+    for i, s in enumerate(hydrated):
+        print(f"  [{i+1}/{len(hydrated)}] scoring {s.date}...")
+        score = score_hawkish(s)
+        scores.append(score)
+
+    if not scores:
+        print("No scores produced.")
+        sys.exit(1)
+
+    # Run the usual diff on the two most recent
+    print(f"\n→ Running diff analysis on most recent two...")
+    analysis = analyse_shift(hydrated[1], hydrated[0])
+    reaction = fetch_market_reaction(hydrated[0])
+
+    print(f"→ Building report with tone chart...")
+    html = build_report_html(hydrated[1], hydrated[0], analysis, scores, reaction)
+
+    save_report(html, f"{bank}_tone_history")
+
+
+def cmd_compare_urls(url1: str, url2: str):
+    """Compare any two statements by URL — for historical analysis."""
+    print(f"→ Fetching {url1}")
+    s1 = hydrate_statement(Statement(bank="RBA", title="", date="", url=url1, text=""))
+    print(f"→ Fetching {url2}")
+    s2 = hydrate_statement(Statement(bank="RBA", title="", date="", url=url2, text=""))
+
+    # Order by date
+    if s1.date > s2.date:
+        old, new = s2, s1
+    else:
+        old, new = s1, s2
+
+    print(f"→ Running Claude analysis...")
+    analysis = analyse_shift(old, new)
+    reaction = fetch_market_reaction(new)
+
+    html = build_report_html(old, new, analysis, None, reaction)
+    save_report(html, "rba_custom_diff")
+
+
+def save_report(html: str, prefix: str):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"{OUTPUT_DIR}/{prefix}_{today}.html"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"\n✅ Report saved: {filename}")
+    try:
+        webbrowser.open(f"file://{os.path.abspath(filename)}")
+    except Exception:
+        pass
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────
-def run(bank: str):
-    if bank == "rba":
-        statements = fetch_rba_statements(n=2)
-    elif bank == "fed":
-        statements = fetch_fed_statements(n=2)
-    else:
-        raise ValueError(f"Unknown bank: {bank}")
-
-    if len(statements) < 2:
-        print(f"Need at least 2 statements, found {len(statements)}.")
-        sys.exit(1)
-
-    print(f"\n✅ Found {len(statements)} statements.")
-    for s in statements:
-        print(f"  · {s.date} — {s.title}")
-
-    print("\n→ Asking Claude for strategist analysis...")
-    analysis = analyse_shift(statements[1], statements[0])
-
-    print("\n→ Building HTML report...")
-    html = build_html_report(statements, analysis)
-
-    # Save output
-    os.makedirs("output", exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"output/{bank}_diff_{today}.html"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    print(f"\n✅ Report saved: {filename}")
-    print(f"   Open it in your browser to view.\n")
-
-    print("\n" + "─" * 60)
-    print("ANALYSIS PREVIEW")
-    print("─" * 60)
-    print(analysis)
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Central Bank Statement Diff Tool")
-    parser.add_argument("--bank", default="rba", choices=["rba", "fed", "both"],
-                        help="Which central bank to analyse")
+    parser = argparse.ArgumentParser(description="Central Bank Statement Diff Tool v2")
+    parser.add_argument("--bank", default="rba", choices=["rba", "fed"])
+    parser.add_argument("--tone-history", action="store_true", help="Build tone tracker chart")
+    parser.add_argument("--n", type=int, default=15, help="Number of historical statements to analyse")
+    parser.add_argument("--compare", nargs=2, metavar=("URL1", "URL2"), help="Compare two specific URLs")
     args = parser.parse_args()
 
-    if args.bank == "both":
-        for b in ("rba", "fed"):
-            print(f"\n{'=' * 60}\n  {b.upper()}\n{'=' * 60}")
-            run(b)
+    if args.compare:
+        cmd_compare_urls(args.compare[0], args.compare[1])
+    elif args.tone_history:
+        cmd_tone_history(args.bank, args.n)
     else:
-        run(args.bank)
+        cmd_compare_recent(args.bank)
