@@ -1,0 +1,29 @@
+name: Central Bank Diff
+on:
+  workflow_dispatch:
+    inputs:
+      bank:
+        description: 'Which central bank (rba, fed, or both)'
+        required: true
+        default: 'rba'
+        type: choice
+        options:
+          - rba
+          - fed
+          - both
+jobs:
+  run-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python cb_diff.py --bank ${{ inputs.bank }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cb-diff-report
+          path: output/*.html
