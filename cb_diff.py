@@ -276,8 +276,8 @@ def build_tone_chart_svg(scores: list[ToneScore]) -> str:
         return "<p>Insufficient data for chart.</p>"
 
     scores = sorted(scores, key=lambda s: s.date)
-    width, height = 900, 360
-    pad_left, pad_right, pad_top, pad_bot = 60, 30, 30, 50
+    width, height = 1200, 400
+    pad_left, pad_right, pad_top, pad_bot = 110, 40, 30, 80
     plot_w = width - pad_left - pad_right
     plot_h = height - pad_top - pad_bot
 
@@ -317,7 +317,7 @@ def build_tone_chart_svg(scores: list[ToneScore]) -> str:
     # axis labels
     title = '<text x="30" y="20" font-size="13" font-weight="700" fill="#0b3d91">Hawkish / Dovish Score Over Time</text>'
 
-    return f"""<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;background:#fafafa;border-radius:6px;">
+    return f"""<svg viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:100%;height:auto;display:block;background:#fafafa;border-radius:6px;">
   {title}
   {''.join(grid)}
   {line}
@@ -347,27 +347,108 @@ def fetch_market_reaction(statement: Statement):
 
 
 # ── HTML REPORT BUILDER ────────────────────────────────────────────────────
+def parse_markdown_to_html(text: str) -> str:
+    """Convert Claude's markdown-ish output to clean HTML."""
+    # Split into logical sections by ## headers
+    lines = text.split("\n")
+    html = []
+    in_bullet_list = False
+
+    def flush_list():
+        nonlocal in_bullet_list
+        if in_bullet_list:
+            html.append("</ul>")
+            in_bullet_list = False
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+
+        if not line:
+            flush_list()
+            continue
+
+        # Horizontal rules — skip
+        if re.match(r"^[-─=]{3,}$", line):
+            flush_list()
+            continue
+
+        # H1 / H2 / H3 markdown headers
+        if line.startswith("# "):
+            flush_list()
+            html.append(f'<h3 class="ah1">{line[2:].strip()}</h3>')
+            continue
+        if line.startswith("## "):
+            flush_list()
+            html.append(f'<h4 class="ah2">{line[3:].strip()}</h4>')
+            continue
+        if line.startswith("### "):
+            flush_list()
+            html.append(f'<h5 class="ah3">{line[4:].strip()}</h5>')
+            continue
+
+        # All-caps section headers (e.g. "HEADLINE READ")
+        if line.isupper() and 5 < len(line) < 60 and not line.startswith("-"):
+            flush_list()
+            html.append(f'<h4 class="ah2">{line}</h4>')
+            continue
+
+        # Bullet points
+        if line.startswith("- ") or line.startswith("• "):
+            if not in_bullet_list:
+                html.append('<ul class="alist">')
+                in_bullet_list = True
+            content = line[2:].strip()
+            # Convert **bold** and *italic*
+            content = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", content)
+            content = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", content)
+            html.append(f"<li>{content}</li>")
+            continue
+
+        # Regular paragraph
+        flush_list()
+        content = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", line)
+        content = re.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<em>\1</em>", content)
+        html.append(f"<p>{content}</p>")
+
+    flush_list()
+    return "\n".join(html)
+
+
+def extract_diff_blocks(old: str, new: str) -> tuple[list[str], list[str]]:
+    """Separate removed and added passages for clean side-by-side display."""
+    old_sentences = re.split(r"(?<=[\.!?])\s+", old)
+    new_sentences = re.split(r"(?<=[\.!?])\s+", new)
+
+    matcher = difflib.SequenceMatcher(None, old_sentences, new_sentences)
+    removed, added = [], []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "delete":
+            removed.extend(s.strip() for s in old_sentences[i1:i2] if s.strip())
+        elif tag == "insert":
+            added.extend(s.strip() for s in new_sentences[j1:j2] if s.strip())
+        elif tag == "replace":
+            removed.extend(s.strip() for s in old_sentences[i1:i2] if s.strip())
+            added.extend(s.strip() for s in new_sentences[j1:j2] if s.strip())
+
+    return removed, added
+
+
 def build_report_html(old: Statement, new: Statement, analysis: str,
                        tone_scores: list[ToneScore] = None,
                        reaction: dict = None) -> str:
-    diff_html = word_diff_html(old.text, new.text)
     old_html = old.text.replace("\n\n", "<br><br>").replace("\n", " ")
     new_html = new.text.replace("\n\n", "<br><br>").replace("\n", " ")
 
-    # Process analysis into HTML
-    analysis_lines = []
-    for line in analysis.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            analysis_lines.append("<br>")
-        elif stripped.isupper() and len(stripped) < 60:
-            analysis_lines.append(f'<h4 class="section-head">{stripped}</h4>')
-        elif stripped.startswith("─"):
-            continue
-        elif stripped.startswith("•") or stripped.startswith("-"):
-            analysis_lines.append(f'<p class="bullet">{stripped}</p>')
-        else:
-            analysis_lines.append(f'<p>{stripped}</p>')
+    # Extract removed/added sentences for clean comparison
+    removed_sentences, added_sentences = extract_diff_blocks(old.text, new.text)
+    removed_html = "".join(f'<li>{s}</li>' for s in removed_sentences[:20]) or "<li>No material removals.</li>"
+    added_html   = "".join(f'<li>{s}</li>' for s in added_sentences[:20]) or "<li>No material additions.</li>"
+
+    # Parse Claude's analysis from markdown to HTML
+    analysis_html = parse_markdown_to_html(analysis)
 
     # Tone chart
     chart_html = ""
@@ -401,25 +482,42 @@ def build_report_html(old: Statement, new: Statement, analysis: str,
 <title>{new.bank} Statement Diff — {new.date}</title>
 <style>
   * {{ box-sizing: border-box; }}
-  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; color: #1a1a1a; max-width: 1200px; margin: 30px auto; padding: 0 24px; line-height: 1.55; background: #f8f9fb; }}
+  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; color: #1a1a1a; max-width: 1320px; margin: 30px auto; padding: 0 24px; line-height: 1.55; background: #f8f9fb; }}
   .header {{ border-bottom: 3px solid #0b3d91; padding-bottom: 14px; margin-bottom: 24px; background: white; padding: 20px 24px; border-radius: 6px 6px 0 0; }}
   h1 {{ font-size: 22px; margin: 0; color: #0b3d91; }}
   h2 {{ font-size: 14px; text-transform: uppercase; letter-spacing: 1.2px; margin-top: 32px; color: #0b3d91; border-bottom: 1px solid #ddd; padding-bottom: 6px; }}
-  h4.section-head {{ margin: 18px 0 6px 0; font-size: 12px; letter-spacing: 1px; color: #0b3d91; text-transform: uppercase; }}
   .meta {{ color: #666; font-size: 12px; margin-top: 4px; }}
   .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }}
   .col {{ background: white; border: 1px solid #e4e7ec; padding: 18px 22px; border-radius: 6px; font-size: 13.5px; line-height: 1.7; max-height: 500px; overflow-y: auto; }}
   .col h4 {{ margin: 0 0 12px 0; font-size: 11px; color: #0b3d91; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #eee; padding-bottom: 6px; }}
-  .diff-box {{ background: white; border: 1px solid #e4e7ec; padding: 24px 30px; border-radius: 6px; font-size: 14px; line-height: 1.85; margin-top: 10px; }}
-  .diff-del {{ background: #ffdee0; color: #a00; text-decoration: line-through; padding: 1px 2px; border-radius: 2px; }}
-  .diff-ins {{ background: #d6f5d6; color: #064; text-decoration: none; font-weight: 600; padding: 1px 2px; border-radius: 2px; }}
-  .analysis-box {{ background: white; border-left: 4px solid #0b3d91; padding: 20px 28px; border-radius: 6px; font-size: 13.5px; margin-top: 10px; line-height: 1.7; }}
-  .analysis-box p {{ margin: 6px 0; }}
-  .analysis-box p.bullet {{ margin: 4px 0 4px 14px; }}
+  /* Analysis box */
+  .analysis-box {{ background: white; border-left: 4px solid #0b3d91; padding: 24px 32px; border-radius: 6px; font-size: 13.5px; margin-top: 10px; line-height: 1.7; }}
+  .analysis-box h3.ah1 {{ font-size: 15px; margin: 0 0 14px 0; color: #0b3d91; border-bottom: 2px solid #0b3d91; padding-bottom: 8px; }}
+  .analysis-box h4.ah2 {{ font-size: 11px; margin: 22px 0 8px 0; color: #0b3d91; text-transform: uppercase; letter-spacing: 1.2px; font-weight: 700; }}
+  .analysis-box h5.ah3 {{ font-size: 13px; margin: 14px 0 6px 0; color: #333; }}
+  .analysis-box p {{ margin: 8px 0; color: #222; }}
+  .analysis-box ul.alist {{ margin: 6px 0 12px 0; padding-left: 22px; list-style: none; }}
+  .analysis-box ul.alist li {{ margin: 8px 0; position: relative; padding-left: 14px; }}
+  .analysis-box ul.alist li:before {{ content: "▸"; position: absolute; left: 0; color: #0b3d91; font-size: 11px; top: 2px; }}
+  .analysis-box strong {{ color: #0b3d91; }}
+  .analysis-box em {{ color: #666; font-style: italic; }}
+
+  /* Clean removed/added diff */
+  .diff-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }}
+  .diff-panel {{ background: white; border: 1px solid #e4e7ec; border-radius: 6px; padding: 18px 22px; max-height: 480px; overflow-y: auto; }}
+  .diff-panel h4 {{ font-size: 11px; margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 1.2px; padding-bottom: 8px; border-bottom: 1px solid #eee; }}
+  .diff-panel.removed h4 {{ color: #a02020; }}
+  .diff-panel.added h4 {{ color: #0a7a0a; }}
+  .diff-panel ul {{ margin: 0; padding-left: 18px; list-style: none; }}
+  .diff-panel li {{ margin: 10px 0; padding-left: 14px; position: relative; font-size: 13px; line-height: 1.55; color: #333; }}
+  .diff-panel.removed li:before {{ content: "−"; position: absolute; left: 0; color: #a02020; font-weight: 700; }}
+  .diff-panel.added li:before {{ content: "+"; position: absolute; left: 0; color: #0a7a0a; font-weight: 700; }}
+
   .legend {{ font-size: 11px; color: #666; margin-top: 10px; }}
   .legend span {{ padding: 2px 8px; border-radius: 3px; margin-right: 8px; font-weight: 600; }}
-  .chart-box {{ background: white; padding: 20px; border: 1px solid #e4e7ec; border-radius: 6px; }}
-  .chart-note {{ font-size: 11px; color: #888; margin-top: 10px; text-align: center; }}
+  .chart-box {{ background: white; padding: 24px; border: 1px solid #e4e7ec; border-radius: 6px; overflow: hidden; }}
+  .chart-box svg {{ max-width: 100%; height: auto; }}
+  .chart-note {{ font-size: 11px; color: #888; margin-top: 12px; text-align: center; }}
   .reaction-box {{ background: #fffbea; border-left: 4px solid #f0a500; padding: 12px 16px; border-radius: 4px; margin-top: 10px; font-size: 13px; }}
   footer {{ margin-top: 40px; font-size: 10px; color: #aaa; text-align: center; padding: 18px; }}
 </style>
@@ -445,16 +543,21 @@ def build_report_html(old: Statement, new: Statement, analysis: str,
   </div>
 </div>
 
-<h2>Word-level Diff</h2>
-<p class="legend">
-  <span class="diff-del">removed</span>
-  <span class="diff-ins">added</span>
-</p>
-<div class="diff-box">{diff_html}</div>
+<h2>What Changed</h2>
+<div class="diff-grid">
+  <div class="diff-panel removed">
+    <h4>− Removed from previous statement</h4>
+    <ul>{removed_html}</ul>
+  </div>
+  <div class="diff-panel added">
+    <h4>+ Added in current statement</h4>
+    <ul>{added_html}</ul>
+  </div>
+</div>
 
 <h2>Claude Analysis — Rates Strategist Read</h2>
 <div class="analysis-box">
-  {''.join(analysis_lines)}
+  {analysis_html}
 </div>
 
 {chart_html}
