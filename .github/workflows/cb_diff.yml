@@ -2,15 +2,14 @@ name: Central Bank Diff
 on:
   workflow_dispatch:
     inputs:
-      bank:
-        description: 'Which central bank (rba, fed, or both)'
+      mode:
+        description: 'Run mode'
         required: true
-        default: 'rba'
+        default: 'tone-history'
         type: choice
         options:
-          - rba
-          - fed
-          - both
+          - recent
+          - tone-history
 jobs:
   run-diff:
     runs-on: ubuntu-latest
@@ -20,7 +19,13 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - run: python cb_diff.py --bank ${{ inputs.bank }}
+      - name: Run diff
+        run: |
+          if [ "${{ inputs.mode }}" = "tone-history" ]; then
+            python cb_diff.py --tone-history --n 15
+          else
+            python cb_diff.py
+          fi
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       - uses: actions/upload-artifact@v4
